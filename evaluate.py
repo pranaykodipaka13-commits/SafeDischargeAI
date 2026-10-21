@@ -7,71 +7,61 @@ from verifier import verify_summary
 def main():
     data = pd.read_csv("data/processed/test.csv")
 
-    total_terms = 0
-    missing_terms = 0
-    notes_with_terms = 0
-    flagged_notes = 0
-    note_results = []
+    detailed_results = []
 
     print(f"Evaluating {len(data)} test notes...")
 
     for index, row in data.iterrows():
         note = str(row["note"])
-        summary = textrank_summarize(note, num_sentences=5)
+        summary = textrank_summarize(note, num_sentences=8)
         results = verify_summary(note, summary)
 
-        # Count configured terms detected by the verifier.
-        total = len(results)
-        missing = 0
-
-        if total > 0:
+        if len(results) > 0:
             missing = int(
                 (results["Verification"] == "POSSIBLY MISSING").sum()
             )
-            notes_with_terms += 1
+        else:
+            missing = 0
 
-        total_terms += total
-        missing_terms += missing
-
-        if missing > 0:
-            flagged_notes += 1
-
-        note_results.append({
+        detailed_results.append({
             "Test row": index,
-            "Terms checked": total,
+            "Source note": note,
+            "Generated summary": summary,
+            "Terms checked": len(results),
             "Possible omissions": missing,
-            "Has configured terms": total > 0,
-            "Flagged for review": missing > 0,
+            "Verification details": (
+                results.to_json(orient="records", force_ascii=False)
+            ),
         })
 
         if (index + 1) % 50 == 0:
             print(f"Processed {index + 1} of {len(data)} notes...")
 
-    output = pd.DataFrame(note_results)
+    output = pd.DataFrame(detailed_results)
+
     output.to_csv(
-        "data/processed/evaluation_results.csv",
-        index=False,
+        "data/processed/detailed_evaluation_results.csv",
+        index=False
     )
 
-    print("\n========== EVALUATION RESULTS ==========")
-    print(f"Test notes processed: {len(data)}")
-    print(f"Notes with configured terms: {notes_with_terms}")
-    print(f"Notes without configured terms: {len(data) - notes_with_terms}")
-    print(f"Term occurrences checked: {total_terms}")
-    print(f"Possible omissions: {missing_terms}")
-    print(f"Notes flagged for review: {flagged_notes}")
+    print("\nDetailed evaluation completed.")
+    print("Saved to: data/processed/detailed_evaluation_results.csv")
 
-    if total_terms > 0:
-        coverage = (total_terms - missing_terms) / total_terms * 100
-        omission_rate = missing_terms / total_terms * 100
+    flagged = output[output["Possible omissions"] > 0]
 
-        print(f"Preliminary term coverage: {coverage:.2f}%")
-        print(f"Preliminary omission rate: {omission_rate:.2f}%")
-    else:
-        print("No configured terms were detected.")
+    print(f"Notes flagged for review: {len(flagged)}")
 
-    print("\nSaved all note results to:")
-    print("data/processed/evaluation_results.csv")
+    if len(flagged) > 0:
+        print("\nFirst 3 flagged notes:")
+        for _, row in flagged.head(3).iterrows():
+            print("\n" + "=" * 70)
+            print(f"Test row: {row['Test row']}")
+            print("\nSOURCE NOTE:")
+            print(str(row["Source note"])[:1500])
+            print("\nGENERATED SUMMARY:")
+            print(row["Generated summary"])
+            print("\nVERIFICATION DETAILS:")
+            print(row["Verification details"])
 
 
 if __name__ == "__main__":

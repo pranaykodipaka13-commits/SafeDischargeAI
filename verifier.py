@@ -1,153 +1,888 @@
 
 import re
 import pandas as pd
-from summarizer import textrank_summarize
+
+
+# ============================================================
+# 1. CLINICAL VOCABULARY
+# ============================================================
+
 
 CLINICAL_TERMS = {
     "Diagnoses": [
-        "hypothyroidism",
-        "hyperthyroidism",
-        "hypoparathyroidism",
-        "hyperparathyroidism",
-        "hyperphosphataemia",
-        "hypertension",
-        "diabetes",
         "pneumonia",
         "infection",
-        "anemia",
-        "anaemia",
-        "chronic lymphocytic thyroiditis",
-        "thyroiditis",
+        "heart failure",
+        "diabetes",
         "cancer",
         "fracture",
-        "kidney disease",
-        "heart failure",
+        "anemia",
+        "anaemia",
+        "asthma",
+        "hypertension",
     ],
     "Symptoms": [
         "pain",
+        "abdominal pain",
+        "chest pain",
+        "neck pain",
+        "lower abdominal pain",
+        "headache",
         "fever",
-        "tiredness",
-        "fatigue",
+        "cough",
         "breathing difficulties",
         "shortness of breath",
-        "muscle aches",
-        "headache",
-        "nausea",
-        "vomiting",
-        "weakness",
-        "swelling",
-        "bleeding",
-        "cough",
-        "abdominal pain",
+        "fatigue",
     ],
     "Procedures": [
         "surgery",
         "biopsy",
-        "isthmectomy",
-        "catheter ablation",
-        "tracheostomy",
         "CT scan",
         "MRI",
-        "ultrasound",
-        "FNA",
+        "tracheostomy",
+        "chest X-ray",
+        "blood cultures",
     ],
     "Medications": [
-        "levothyroxine",
-        "betamethasone",
-        "calcium gluconate",
-        "alphacalcidol",
-        "calcium carbonate",
+        "insulin",
         "saline infusion",
         "antibiotics",
-        "insulin",
-        "aspirin",
-        "paracetamol",
     ],
 }
 
+
+
+# ============================================================
+# 2. TEXT NORMALIZATION AND TERM MATCHING
+# ============================================================
+
+def normalize_text(text):
+    """Lowercase text and normalize whitespace."""
+    return re.sub(r"\s+", " ", str(text)).strip().lower()
+
+
+def canonical_term(term):
+    """Map supported spelling variants to one canonical form."""
+    term = normalize_text(term)
+
+    spelling_variants = {
+        "anaemia": "anemia",
+    }
+
+    return spelling_variants.get(term, term)
+
+
+def term_pattern(term):
+    """
+    Create a case-insensitive regex for a term.
+
+    Supports word boundaries, flexible whitespace,
+    common plural forms, and anemia/anaemia variants.
+    """
+    term = normalize_text(term)
+
+    if not term:
+        return re.compile(r"(?!)")
+
+    if canonical_term(term) == "anemia":
+        return re.compile(
+            r"(?<!\w)(?:anemia|anaemia)(?!\w)",
+            re.IGNORECASE,
+        )
+
+    words = term.split()
+
+    def plural_pattern(word):
+        if word.endswith("y") and len(word) > 1:
+            return re.escape(word[:-1]) + r"(?:y|ies)"
+
+        if word.endswith(("s", "x", "z", "ch", "sh")):
+            return re.escape(word) + r"(?:es)?"
+
+        return re.escape(word) + r"s?"
+
+    if len(words) == 1:
+        pattern = plural_pattern(words[0])
+    else:
+        prefix = r"\s+".join(
+            re.escape(word) for word in words[:-1]
+        )
+        pattern = prefix + r"\s+" + plural_pattern(words[-1])
+
+    return re.compile(
+        r"(?<!\w)" + pattern + r"(?!\w)",
+        re.IGNORECASE,
+    )
+
+
+def _term_spans(text, term):
+    """Return all matches for a configured term."""
+    return list(term_pattern(term).finditer(str(text)))
+
+
+# ============================================================
+# 3. NEGATION AND UNCERTAINTY
+# ============================================================
+
 NEGATION_PATTERNS = [
-    r"\bno evidence of\b",
-    r"\bno sign of\b",
-    r"\bno history of\b",
-    r"\bdenies\b",
+    r"\bno\b",
+    r"\bnot\b",
+    r"\bdenies?\b",
+    r"\bdenied\b",
     r"\bwithout\b",
     r"\bnegative for\b",
+    r"\babsence of\b",
+    r"\bfree of\b",
+    r"\bruled out\b",
+    r"\bwas excluded\b",
+    r"\bwere excluded\b",
+    r"\bhas been excluded\b",
+    r"\bhas been ruled out\b",
     r"\bnot present\b",
+    r"\bno evidence of\b",
 ]
 
 UNCERTAINTY_PATTERNS = [
-    r"\brule out\b",
+    r"\bcould represent\b",
+    r"\bnot confirmed\b",
     r"\bpossible\b",
     r"\bpossibly\b",
+    r"\bprobable\b",
     r"\bsuspected\b",
+    r"\bsuspicion of\b",
     r"\bmay have\b",
+    r"\bmight have\b",
+    r"\bcould have\b",
+    r"\buncertain\b",
+    r"\bquestionable\b",
+    r"\bpotential\b",
 ]
 
+PROCEDURE_CATEGORIES = {"Procedures"}
+MEDICATION_CATEGORIES = {"Medications"}
 
-def find_term_status(text, term):
-    text = str(text).lower()
-    term = term.lower()
+CONTRAST_PATTERN = re.compile(
+    r"\b(?:but|however|although|whereas)\b",
+    re.IGNORECASE,
+)
 
-    for match in re.finditer(re.escape(term), text):
-        start = max(0, match.start() - 100)
-        end = min(len(text), match.end() + 50)
-        context = text[start:end]
 
-        if any(re.search(p, context) for p in UNCERTAINTY_PATTERNS):
+def _clause_bounds(text, start, end):
+    """Find the clause containing a term occurrence."""
+    left = 0
+    right = len(text)
+
+    for match in re.finditer(r"[.!?;,\n]", text):
+        if match.end() <= start:
+            left = match.end()
+        elif match.start() >= end:
+            right = match.start()
+            break
+
+    before = text[left:start]
+    contrasts = list(CONTRAST_PATTERN.finditer(before))
+
+    if contrasts:
+        left += contrasts[-1].end()
+
+    return left, right
+
+
+def _is_negated(text, term_start, term_end):
+    """Check local negation cues around a term occurrence."""
+    before = text[:term_start]
+    after = text[term_end:]
+
+    if re.match(r"\s*-\s*free\b", after, re.IGNORECASE):
+        return True
+
+    local_before = " ".join(before.split()[-8:])
+
+    for pattern in NEGATION_PATTERNS:
+        if re.search(pattern, local_before, re.IGNORECASE):
+            return True
+
+    local_after = " ".join(after.split()[:8])
+
+    for pattern in NEGATION_PATTERNS:
+        if re.search(pattern, local_after, re.IGNORECASE):
+            return True
+
+    return False
+
+
+def find_occurrence_status(text, term, start, category):
+    """Determine the status of one term occurrence."""
+    text = str(text)
+    occurrence = None
+
+    for match in _term_spans(text, term):
+        if match.start() == start:
+            occurrence = match
+            break
+
+    if occurrence is None:
+        return "NOT_FOUND"
+
+    if (
+        category in PROCEDURE_CATEGORIES
+        or category in MEDICATION_CATEGORIES
+    ):
+        return "MENTIONED"
+
+    left, right = _clause_bounds(
+        text,
+        occurrence.start(),
+        occurrence.end(),
+    )
+
+    clause = text[left:right]
+    relative_start = occurrence.start() - left
+    relative_end = occurrence.end() - left
+
+    if _is_negated(clause, relative_start, relative_end):
+        return "NEGATED"
+
+    before = clause[:relative_start]
+
+    for pattern in UNCERTAINTY_PATTERNS:
+        if re.search(pattern, before, re.IGNORECASE):
             return "UNCERTAIN"
 
-        if any(re.search(p, context) for p in NEGATION_PATTERNS):
-            return "NEGATED"
+    return "AFFIRMED_OR_MENTIONED"
 
+
+def find_term_status(text, term, category):
+    """Determine the overall status across all occurrences."""
+    matches = _term_spans(text, term)
+
+    if not matches:
+        return "NOT_FOUND"
+
+    statuses = [
+        find_occurrence_status(
+            text,
+            term,
+            match.start(),
+            category,
+        )
+        for match in matches
+    ]
+
+    if "AFFIRMED_OR_MENTIONED" in statuses:
         return "AFFIRMED_OR_MENTIONED"
+
+    if "UNCERTAIN" in statuses:
+        return "UNCERTAIN"
+
+    if "NEGATED" in statuses:
+        return "NEGATED"
+
+    if "MENTIONED" in statuses:
+        return "MENTIONED"
 
     return "NOT_FOUND"
 
 
-def verify_summary(note, summary):
-    results = []
+# ============================================================
+# 4. CONFIGURED TERMS AND SOURCE MENTIONS
+# ============================================================
 
-    for category, terms in CLINICAL_TERMS.items():
-        for term in terms:
-            source_status = find_term_status(note, term)
+def _configured_terms():
+    """Return all configured (term, category) pairs."""
+    if isinstance(CLINICAL_TERMS, dict):
+        return [
+            (term, category)
+            for category, terms in CLINICAL_TERMS.items()
+            for term in terms
+        ]
 
-            if source_status == "NOT_FOUND":
-                continue
+    if isinstance(CLINICAL_TERMS, pd.DataFrame):
+        columns = {
+            column.lower(): column
+            for column in CLINICAL_TERMS.columns
+        }
 
-            summary_status = find_term_status(summary, term)
+        term_column = columns.get("term")
+        category_column = columns.get("category")
 
-            if summary_status == "NOT_FOUND":
-                verification = "POSSIBLY MISSING"
-            elif source_status != summary_status:
-                verification = "CHECK STATUS MISMATCH"
-            else:
-                verification = "TERM FOUND - REVIEW CONTEXT"
+        if term_column and category_column:
+            return list(
+                zip(
+                    CLINICAL_TERMS[term_column].astype(str),
+                    CLINICAL_TERMS[category_column].astype(str),
+                )
+            )
 
-            results.append({
+    return []
+
+
+def find_source_mentions(text):
+    """Find configured terms, preferring longer overlapping phrases."""
+    text = str(text)
+    mentions = []
+
+    for term, category in _configured_terms():
+        for match in _term_spans(text, term):
+            mentions.append({
+                "Term": term,
                 "Category": category,
-                "Clinical term": term,
-                "Source status": source_status,
-                "Summary status": summary_status,
-                "Verification": verification,
+                "Start": match.start(),
+                "End": match.end(),
+                "Status": find_occurrence_status(
+                    text,
+                    term,
+                    match.start(),
+                    category,
+                ),
             })
 
-    return pd.DataFrame(results)
+    mentions.sort(
+        key=lambda item: (
+            item["Start"],
+            -(item["End"] - item["Start"]),
+        )
+    )
+
+    filtered = []
+
+    for mention in mentions:
+        overlaps_longer = any(
+            other["Start"] <= mention["Start"]
+            and other["End"] >= mention["End"]
+            and (
+                other["Start"] < mention["Start"]
+                or other["End"] > mention["End"]
+            )
+            for other in mentions
+        )
+
+        if not overlaps_longer:
+            filtered.append(mention)
+
+    return filtered
 
 
-if __name__ == "__main__":
-    data = pd.read_csv("data/processed/test.csv")
-    note = data.iloc[0]["note"]
-    summary = textrank_summarize(note, num_sentences=5)
+# ============================================================
+# 5. SUMMARY STATUS AND PRIORITY
+# ============================================================
 
-    print("\nGENERATED SUMMARY:\n")
-    print(summary)
+PAIN_PHRASES = [
+    "lower abdominal pain",
+    "abdominal pain",
+    "chest pain",
+    "neck pain",
+]
 
-    results = verify_summary(note, summary)
 
-    print("\nCLINICAL INFORMATION VERIFICATION:\n")
-    if results.empty:
-        print("No configured clinical terms found.")
-    else:
-        print(results.to_string(index=False))
-        print("\nVerification counts:")
-        print(results["Verification"].value_counts().to_string())
+def _independent_summary_matches(summary, term):
+    """
+    Return matches for a term that are not contained inside
+    a longer configured clinical phrase.
+    """
+    summary = str(summary)
+    normalized_term = normalize_text(term)
+
+    aliases = {
+        "anemia": ["anemia", "anaemia"],
+        "anaemia": ["anaemia", "anemia"],
+    }
+
+    variants = aliases.get(normalized_term, [term])
+    matches = []
+
+    for variant in variants:
+        for match in term_pattern(variant).finditer(summary):
+            matches.append((variant, match))
+
+    if not matches:
+        return []
+
+    configured_terms = _configured_terms()
+    independent_matches = []
+
+    for matched_term, match in matches:
+        contained_in_longer_phrase = False
+
+        for configured_term, _ in configured_terms:
+            longer_term = normalize_text(configured_term)
+
+            if len(longer_term) <= len(normalized_term):
+                continue
+
+            for longer_match in term_pattern(longer_term).finditer(summary):
+                if (
+                    longer_match.start() <= match.start()
+                    and longer_match.end() >= match.end()
+                    and (
+                        longer_match.start() < match.start()
+                        or longer_match.end() > match.end()
+                    )
+                ):
+                    if normalized_term == "pain":
+                        continue
+
+                    contained_in_longer_phrase = True
+                    break
+
+            if contained_in_longer_phrase:
+                break
+
+        if not contained_in_longer_phrase:
+            independent_matches.append((matched_term, match))
+
+    return independent_matches
+
+
+def summary_contains_term(summary, term):
+    """Check whether a term appears independently in the summary."""
+    return bool(_independent_summary_matches(summary, term))
+
+
+def _summary_status(summary, term, category):
+    """Determine the status of independent summary matches."""
+    independent_matches = _independent_summary_matches(
+        summary,
+        term,
+    )
+
+    if not independent_matches:
+        return "NOT_FOUND"
+
+    statuses = [
+        find_occurrence_status(
+            summary,
+            matched_term,
+            match.start(),
+            category,
+        )
+        for matched_term, match in independent_matches
+    ]
+
+    if "AFFIRMED_OR_MENTIONED" in statuses:
+        return "AFFIRMED_OR_MENTIONED"
+
+    if "UNCERTAIN" in statuses:
+        return "UNCERTAIN"
+
+    if "NEGATED" in statuses:
+        return "NEGATED"
+
+    if "MENTIONED" in statuses:
+        return "MENTIONED"
+
+    return "NOT_FOUND"
+
+
+def _priority(term, category):
+    """Assign a simple rule-based review priority."""
+    high_priority = {
+        "pneumonia",
+        "infection",
+        "heart failure",
+        "cancer",
+        "fracture",
+    }
+
+    if canonical_term(term) in high_priority:
+        return "High"
+
+    if category in {"Diagnoses", "Medications"}:
+        return "Medium"
+
+    return "Low"
+
+
+# ============================================================
+# 6. VERIFY SUMMARY AGAINST SOURCE
+# ============================================================
+
+def _pain_phrase_mentions(text, category):
+    """
+    Return (phrase, status) for each specific pain mention in text.
+
+    A phrase nested inside a longer one is dropped.
+    """
+    text = str(text)
+    spans = [
+        (phrase, match.start(), match.end())
+        for phrase in PAIN_PHRASES
+        for match in term_pattern(phrase).finditer(text)
+    ]
+
+    independent = [
+        (phrase, start, end)
+        for phrase, start, end in spans
+        if not any(
+            other_start <= start
+            and other_end >= end
+            and (other_start < start or other_end > end)
+            for _, other_start, other_end in spans
+        )
+    ]
+    independent.sort(key=lambda item: item[1])
+
+    return [
+        (
+            phrase,
+            find_occurrence_status(text, phrase, start, category),
+        )
+        for phrase, start, _ in independent
+    ]
+
+
+# ============================================================
+# 7. MEASURED CLINICAL FINDING DETECTOR
+# ============================================================
+
+def _extract_measured_findings(text):
+    """
+    Extract a limited set of measured lesions, masses, tumors,
+    nodules, cysts, and fibroids.
+
+    This is a rule-based detector. It does not identify every
+    possible clinical finding and requires human review.
+    """
+    text = str(text)
+
+    kind_pattern = (
+        r"lesions?|masses?|tumou?rs?|nodules?|cysts?|fibroids?"
+    )
+    size_pattern = r"\b\d+(?:\.\d+)?\s*-?\s*(?:cm|mm)\b"
+
+    site_pattern = (
+        r"iliac\s+fossa|frontoparietal\s+region|parietal\s+lobe|"
+        r"adrenal\s+gland|kidneys?|livers?|lungs?|breasts?|thyroid|"
+        r"brain|pancreas|ovaries|ovary|colon|bowel|uterus|uterine|"
+        r"mediastinum|mediastinal|subcutaneous|pelvis|pelvic|"
+        r"abdomen|abdominal|scrotum|scrotal|skin|neck|chest"
+    )
+
+    # Pattern A:
+    # "4 cm lesion in the left kidney"
+    # "an 8-cm uterine fibroid"
+    # "80 mm mass"
+    before_pattern = re.compile(
+        rf"(?P<size>{size_pattern})\s+"
+        rf"(?:(?P<preceding_site>{site_pattern})\s+)?"
+        rf"(?P<kind>{kind_pattern})\b"
+        rf"(?:\s+(?:in|of)\s+(?:the\s+)?"
+        rf"(?P<side>left|right|bilateral)?\s*"
+        rf"(?P<following_site>{site_pattern})\b)?",
+        re.IGNORECASE,
+    )
+
+    # Pattern B:
+    # "mass in the right iliac fossa measuring 7 cm in diameter"
+    # "mediastinal mass measuring 8 cm in its largest dimension"
+    after_pattern = re.compile(
+        rf"(?P<kind>{kind_pattern})\b"
+        rf"(?:(?![.!?]).){{0,120}}?"
+        rf"\b(?:measur\w*|diameter|dimension|thick(?:ness)?)\b"
+        rf"(?:(?![.!?]).){{0,45}}?"
+        rf"(?P<size>{size_pattern})",
+        re.IGNORECASE,
+    )
+
+    findings = []
+    seen = set()
+
+    for pattern in (before_pattern, after_pattern):
+        for match in pattern.finditer(text):
+            start = match.start()
+            end = match.end()
+
+            sentence_start = max(
+                text.rfind(".", 0, start),
+                text.rfind("!", 0, start),
+                text.rfind("?", 0, start),
+                text.rfind("\n", 0, start),
+            ) + 1
+
+            prefix = text[sentence_start:start].lower()
+
+            # Conservative check for negation and uncertainty cues.
+            if re.search(
+                r"\b(?:no|not|without|negative\s+for|absence\s+of|"
+                r"possible|possibly|suspected|unlikely)\b"
+                r"(?:\W+\w+){0,5}\W*$",
+                prefix,
+            ):
+                continue
+
+            size_match = re.search(
+                size_pattern,
+                match.group("size"),
+                re.IGNORECASE,
+            )
+            if not size_match:
+                continue
+
+            raw_kind = match.group("kind").lower().rstrip("s")
+
+            if raw_kind in ("tumor", "tumour"):
+                kind = "tumor"
+            elif raw_kind == "fibroid":
+                kind = "fibroid"
+            elif raw_kind == "cyst":
+                kind = "cyst"
+            elif raw_kind == "nodule":
+                kind = "nodule"
+            elif raw_kind == "mass":
+                kind = "mass"
+            else:
+                kind = "lesion"
+
+            context_start = max(sentence_start, start - 60)
+            context_end = min(len(text), end + 80)
+            phrase = text[context_start:context_end]
+
+            side_match = re.search(
+                r"\b(left|right|bilateral)\b",
+                phrase,
+                re.IGNORECASE,
+            )
+
+            # Prefer a site explicitly captured next to the finding.
+            site_value = (
+                match.groupdict().get("following_site")
+                or match.groupdict().get("preceding_site")
+            )
+
+            # For the "mass measuring 7 cm" form, find the closest
+            # anatomical site in the same local context.
+            if not site_value:
+                site_matches = list(
+                    re.finditer(site_pattern, phrase, re.IGNORECASE)
+                )
+                if site_matches:
+                    kind_position = phrase.lower().find(
+                        match.group("kind").lower()
+                    )
+                    closest_site = min(
+                        site_matches,
+                        key=lambda item: abs(item.start() - kind_position),
+                    )
+                    site_value = closest_site.group(0)
+
+            side_value = (
+                match.groupdict().get("side")
+                or (side_match.group(1) if side_match else "")
+            )
+
+            finding = {
+                "term": re.sub(r"\s+", " ", match.group(0)).strip(),
+                "size": re.sub(
+                    r"\s+",
+                    "",
+                    size_match.group(0),
+                ).replace("-", ""),
+                "kind": kind,
+                "side": side_value.lower() if side_value else "",
+                "site": (
+                    re.sub(r"\s+", " ", site_value).lower()
+                    if site_value else ""
+                ),
+            }
+
+            key = (
+                finding["size"],
+                finding["kind"],
+                finding["side"],
+                finding["site"],
+            )
+
+            if key not in seen:
+                findings.append(finding)
+                seen.add(key)
+
+    return findings
+
+
+def _finding_is_preserved(finding, summary):
+    """
+    Check whether the summary preserves the measured finding.
+
+    The measurement and finding type must be present. If a side
+    or anatomical site was extracted, it must also be present.
+    """
+    summary = str(summary)
+
+    size_value = re.match(
+        r"(\d+(?:\.\d+)?)\s*-?\s*(cm|mm)",
+        finding["size"],
+        re.IGNORECASE,
+    )
+
+    if not size_value:
+        return False
+
+    size_pattern = re.compile(
+        r"\b"
+        + re.escape(size_value.group(1))
+        + r"\s*-?\s*"
+        + re.escape(size_value.group(2))
+        + r"\b",
+        re.IGNORECASE,
+    )
+
+    kind_pattern = re.compile(
+        r"\b" + re.escape(finding["kind"]) + r"s?\b",
+        re.IGNORECASE,
+    )
+
+    size_ok = size_pattern.search(summary) is not None
+    kind_ok = kind_pattern.search(summary) is not None
+
+    side_ok = (
+        not finding["side"]
+        or re.search(
+            r"\b" + re.escape(finding["side"]) + r"\b",
+            summary,
+            re.IGNORECASE,
+        ) is not None
+    )
+
+    site_ok = (
+        not finding["site"]
+        or re.search(
+            r"\b" + re.escape(finding["site"]) + r"\b",
+            summary,
+            re.IGNORECASE,
+        ) is not None
+    )
+
+    return size_ok and kind_ok and side_ok and site_ok
+
+
+# ============================================================
+# 8. MAIN SUMMARY VERIFICATION
+# ============================================================
+
+def verify_summary(source_note, summary):
+    """
+    Compare configured source terms against summary terms.
+
+    Returns a DataFrame containing term, category, source status,
+    summary status, verification label, and review priority.
+    """
+    columns = [
+        "Term",
+        "Category",
+        "Source Status",
+        "Summary Status",
+        "Verification",
+        "Priority",
+    ]
+
+    source_note = str(source_note)
+    summary = str(summary)
+
+    rows = []
+    seen = set()
+
+    for term, category in _configured_terms():
+        if not _term_spans(source_note, term):
+            continue
+
+        key = (canonical_term(term), category)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        source_status = find_term_status(
+            source_note,
+            term,
+            category,
+        )
+
+        summary_status = _summary_status(
+            summary,
+            term,
+            category,
+        )
+
+        # For the general term "pain", the summary must account for
+        # every specific non-negated pain phrase in the source.
+        if normalize_text(term) == "pain":
+            source_pain = _pain_phrase_mentions(source_note, category)
+            summary_pain = {
+                phrase
+                for phrase, _ in _pain_phrase_mentions(summary, category)
+            }
+
+            if source_pain:
+                required = {
+                    phrase
+                    for phrase, status in source_pain
+                    if status != "NEGATED"
+                }
+
+                if required:
+                    covered = required <= summary_pain
+                else:
+                    covered = any(
+                        phrase in summary_pain
+                        for phrase, _ in source_pain
+                    )
+
+                if not covered:
+                    summary_status = "NOT_FOUND"
+
+        if summary_status == "NOT_FOUND":
+            if source_status == "NEGATED":
+                verification = "NEGATED IN SOURCE - REVIEW"
+            elif source_status == "UNCERTAIN":
+                verification = "UNCERTAIN IN SOURCE - REVIEW"
+            else:
+                verification = "POSSIBLY MISSING"
+
+        elif (
+            source_status == "NEGATED"
+            and summary_status != "NEGATED"
+        ) or (
+            source_status == "AFFIRMED_OR_MENTIONED"
+            and summary_status == "NEGATED"
+        ):
+            verification = "CHECK STATUS MISMATCH"
+
+        elif (
+            source_status == "UNCERTAIN"
+            and summary_status == "AFFIRMED_OR_MENTIONED"
+        ):
+            verification = "CHECK STATUS MISMATCH"
+
+        else:
+            verification = "TERM FOUND - REVIEW CONTEXT"
+
+        rows.append({
+            "Term": term,
+            "Category": category,
+            "Source Status": source_status,
+            "Summary Status": summary_status,
+            "Verification": verification,
+            "Priority": _priority(term, category),
+        })
+
+    # Additional targeted check for measured clinical findings.
+    for finding in _extract_measured_findings(source_note):
+        preserved = _finding_is_preserved(finding, summary)
+
+        rows.append({
+            "Term": finding["term"],
+            "Category": "Clinical Findings",
+            "Source Status": "AFFIRMED_OR_MENTIONED",
+            "Summary Status": (
+                "AFFIRMED_OR_MENTIONED" if preserved else "NOT_FOUND"
+            ),
+            "Verification": (
+                "TERM FOUND - REVIEW CONTEXT"
+                if preserved
+                else "POSSIBLY MISSING"
+            ),
+            "Priority": "High",
+        })
+
+    return pd.DataFrame(rows, columns=columns)
