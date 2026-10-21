@@ -15,7 +15,7 @@ CLINICAL_KEYWORDS = {
         "hyperthyroidism", "syndrome", "thyroiditis",
         "cancer", "tumor", "tumour", "infection",
         "pneumonia", "diabetes", "heart failure",
-        "liposarcoma", "hypoparathyroidism"
+        "liposarcoma", "hypoparathyroidism", "hypertension"
     ],
     "symptoms": [
         "symptoms", "pain", "fatigue", "tiredness",
@@ -35,6 +35,16 @@ CLINICAL_KEYWORDS = {
         "surgery", "surgical resection", "isthmectomy",
         "radiation therapy", "therapy", "procedure"
     ],
+    "clinical_findings": [
+        "lesion", "mass", "nodule", "opacity",
+        "fracture", "enlargement", "abnormality",
+        "kidney", "tumor", "tumour"
+    ],
+    "medical_history": [
+        "medical history", "past medical history",
+        "history includes", "history of",
+        "comorbidities", "underlying condition"
+    ],
     "discharge_followup": [
         "discharged", "follow-up", "follow up",
         "appointment", "advised", "recommend",
@@ -51,8 +61,8 @@ def split_sentences(text):
     try:
         return sent_tokenize(text)
     except LookupError:
-        nltk.download("punkt")
-        nltk.download("punkt_tab")
+        nltk.download("punkt", quiet=True)
+        nltk.download("punkt_tab", quiet=True)
         return sent_tokenize(text)
 
 
@@ -75,6 +85,28 @@ def sentence_importance(sentence):
     if "follow-up:" in sentence_lower or "follow up:" in sentence_lower:
         score += 2
 
+    # Prioritize measurements and specific clinical findings.
+    if re.search(
+        r"\b\d+(?:\.\d+)?\s*(?:cm|mm|mg|ml|kg)\b",
+        sentence_lower
+    ):
+        score += 3
+
+    # Prioritize explicit medical history.
+    if any(phrase in sentence_lower for phrase in [
+        "medical history",
+        "past medical history",
+        "history includes",
+        "history of"
+    ]):
+        score += 2
+
+    # Prioritize important investigation findings.
+    if any(term in sentence_lower for term in [
+        "lesion", "mass", "nodule", "opacity"
+    ]):
+        score += 3
+
     return score
 
 
@@ -93,7 +125,12 @@ def textrank_summarize(text, num_sentences=8):
 
     # Convert sentences into numerical TF-IDF vectors.
     vectorizer = TfidfVectorizer(stop_words="english")
-    sentence_vectors = vectorizer.fit_transform(sentences)
+
+    try:
+        sentence_vectors = vectorizer.fit_transform(sentences)
+    except ValueError:
+        # Handle notes containing no usable TF-IDF terms.
+        return " ".join(sentences[:num_sentences])
 
     # Measure similarity between sentences.
     similarity_matrix = cosine_similarity(sentence_vectors)
@@ -110,8 +147,7 @@ def textrank_summarize(text, num_sentences=8):
             + clinical_score * 0.5
         )
 
-        # Give a small preference to shorter sentences so that
-        # long, repetitive sentences do not dominate unnecessarily.
+        # Slightly reduce the influence of very long sentences.
         word_count = len(sentence.split())
 
         if word_count > 60:
@@ -127,17 +163,63 @@ def textrank_summarize(text, num_sentences=8):
 
     selected_indices = []
 
-    for index in ranked_indices:
-        is_redundant = False
+    def add_sentence(index):
+        """Add a sentence unless it is redundant."""
+        if index in selected_indices:
+            return False
 
         for selected in selected_indices:
             if similarity_matrix[index, selected] > 0.80:
-                is_redundant = True
+                return False
+
+        selected_indices.append(index)
+        return True
+
+    # First prioritize a sentence containing presenting symptoms.
+    symptom_keywords = [
+        "pain", "fever", "nausea", "vomiting",
+        "cough", "fatigue", "weakness",
+        "shortness of breath", "breathing difficulties", "dizziness", "headache"
+    ]
+  
+    if num_sentences >= 3:
+        for index, sentence in enumerate(sentences):
+            sentence_lower = sentence.lower()
+
+            # Avoid selecting a sentence that mentions only
+            # a negated symptom as though it were present.
+            symptom_present = any(
+                term in sentence_lower
+                for term in symptom_keywords
+                if term not in ("shortness of breath", "breathing difficulties")
+            )
+
+            if symptom_present and add_sentence(index):
                 break
 
-        if not is_redundant:
-            selected_indices.append(index)
+    for index in ranked_indices:
+        sentence_lower = sentences[index].lower()
 
+        if any(term in sentence_lower for term in symptom_keywords):
+            if add_sentence(index):
+                break
+ # Prioritize medical history if space remains.
+    if num_sentences >= 3 and len(selected_indices) < num_sentences:
+        history_keywords = [
+            "medical history", "past medical history",
+            "history of", "diabetes", "hypertension",
+            "comorbidities"
+        ]
+
+        for index, sentence in enumerate(sentences):
+            sentence_lower = sentence.lower()
+
+            if any(term in sentence_lower for term in history_keywords):
+                if add_sentence(index):
+                    break
+
+    # Fill remaining slots using the existing importance ranking.
+    for index in ranked_indices:
         if len(selected_indices) >= num_sentences:
             break
 
