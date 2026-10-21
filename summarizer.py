@@ -223,6 +223,7 @@ def textrank_summarize(text, num_sentences=8):
         if len(selected_indices) >= num_sentences:
             break
 
+        add_sentence(index)
     # Return selected sentences in their original order.
     selected_indices.sort()
 
