@@ -24,6 +24,7 @@ CLINICAL_TERMS = {
     "Symptoms": [
         "pain",
         "abdominal pain",
+         "tenderness",
         "chest pain",
         "neck pain",
         "lower abdominal pain",
