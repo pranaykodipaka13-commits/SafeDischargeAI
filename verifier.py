@@ -7,7 +7,6 @@ import pandas as pd
 # 1. CLINICAL VOCABULARY
 # ============================================================
 
-
 CLINICAL_TERMS = {
     "Diagnoses": [
         "pneumonia",
@@ -24,7 +23,7 @@ CLINICAL_TERMS = {
     "Symptoms": [
         "pain",
         "abdominal pain",
-         "tenderness",
+        "tenderness",
         "chest pain",
         "neck pain",
         "lower abdominal pain",
@@ -50,7 +49,6 @@ CLINICAL_TERMS = {
         "antibiotics",
     ],
 }
-
 
 
 # ============================================================
@@ -411,7 +409,9 @@ def _independent_summary_matches(summary, term):
             if len(longer_term) <= len(normalized_term):
                 continue
 
-            for longer_match in term_pattern(longer_term).finditer(summary):
+            for longer_match in term_pattern(
+                longer_term
+            ).finditer(summary):
                 if (
                     longer_match.start() <= match.start()
                     and longer_match.end() >= match.end()
@@ -505,6 +505,7 @@ def _pain_phrase_mentions(text, category):
     A phrase nested inside a longer one is dropped.
     """
     text = str(text)
+
     spans = [
         (phrase, match.start(), match.end())
         for phrase in PAIN_PHRASES
@@ -521,12 +522,18 @@ def _pain_phrase_mentions(text, category):
             for _, other_start, other_end in spans
         )
     ]
+
     independent.sort(key=lambda item: item[1])
 
     return [
         (
             phrase,
-            find_occurrence_status(text, phrase, start, category),
+            find_occurrence_status(
+                text,
+                phrase,
+                start,
+                category,
+            ),
         )
         for phrase, start, _ in independent
     ]
@@ -541,8 +548,8 @@ def _extract_measured_findings(text):
     Extract a limited set of measured lesions, masses, tumors,
     nodules, cysts, and fibroids.
 
-    This is a rule-based detector. It does not identify every
-    possible clinical finding and requires human review.
+    This rule-based detector does not identify every possible
+    clinical finding and requires human review.
     """
     text = str(text)
 
@@ -616,6 +623,7 @@ def _extract_measured_findings(text):
                 match.group("size"),
                 re.IGNORECASE,
             )
+
             if not size_match:
                 continue
 
@@ -656,14 +664,19 @@ def _extract_measured_findings(text):
                 site_matches = list(
                     re.finditer(site_pattern, phrase, re.IGNORECASE)
                 )
+
                 if site_matches:
                     kind_position = phrase.lower().find(
                         match.group("kind").lower()
                     )
+
                     closest_site = min(
                         site_matches,
-                        key=lambda item: abs(item.start() - kind_position),
+                        key=lambda item: abs(
+                            item.start() - kind_position
+                        ),
                     )
+
                     site_value = closest_site.group(0)
 
             side_value = (
@@ -672,7 +685,9 @@ def _extract_measured_findings(text):
             )
 
             finding = {
-                "term": re.sub(r"\s+", " ", match.group(0)).strip(),
+                "term": re.sub(
+                    r"\s+", " ", match.group(0)
+                ).strip(),
                 "size": re.sub(
                     r"\s+",
                     "",
@@ -757,15 +772,131 @@ def _finding_is_preserved(finding, summary):
 
 
 # ============================================================
-# 8. MAIN SUMMARY VERIFICATION
+# 8. LOCATION-SPECIFIC TENDERNESS DETECTOR
+# ============================================================
+
+def _extract_location_specific_tenderness(text):
+    """
+    Extract tenderness mentions that specify a side and anatomical site.
+
+    Examples:
+    - tenderness in the left abdominal region
+    - right abdominal tenderness
+
+    This is a limited rule-based detector requiring human review.
+    """
+    text = str(text)
+
+    site_pattern = (
+        r"abdominal|abdomen|chest|pelvic|pelvis|"
+        r"iliac\s+fossa|neck|back|flank|"
+        r"shoulder|arm|leg|thigh|calf|"
+        r"wrist|ankle|knee|elbow"
+    )
+
+    patterns = [
+        # Example: tenderness in the left abdominal region
+        re.compile(
+            rf"\btenderness\b\s+(?:in|over|of|along)\s+"
+            rf"(?:the\s+)?(?P<side>left|right|bilateral)\s+"
+            rf"(?P<site>{site_pattern})"
+            rf"(?:\s+(?:region|area))?\b",
+            re.IGNORECASE,
+        ),
+
+        # Example: left abdominal tenderness
+        re.compile(
+            rf"\b(?P<side>left|right|bilateral)\s+"
+            rf"(?P<site>{site_pattern})\s+"
+            rf"tenderness\b",
+            re.IGNORECASE,
+        ),
+    ]
+
+    findings = []
+    seen = set()
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            side = match.group("side").lower()
+            site = re.sub(
+                r"\s+", " ", match.group("site").lower()
+            )
+
+            finding = {
+                "term": f"{side} {site} tenderness",
+                "side": side,
+                "site": site,
+            }
+
+            key = (side, site)
+
+            if key not in seen:
+                findings.append(finding)
+                seen.add(key)
+
+    return findings
+
+
+def _tenderness_location_status(finding, summary):
+    """
+    Check whether tenderness and its specified location appear
+    to be preserved in the summary.
+
+    Returns:
+    - preserved
+    - missing
+    - mismatch
+    """
+    summary = str(summary).lower()
+    side = finding["side"]
+    site = finding["site"]
+
+    # Tenderness itself must appear in the summary.
+    if not re.search(r"\btenderness\b", summary):
+        return "missing"
+
+    # The anatomical site must appear.
+    if not re.search(r"\b" + re.escape(site) + r"\b", summary):
+        return "missing"
+
+    # Check whether the documented side is preserved.
+    if not re.search(r"\b" + re.escape(side) + r"\b", summary):
+        opposite_sides = {
+            "left": ("right",),
+            "right": ("left",),
+            "bilateral": ("left", "right"),
+        }
+
+        if any(
+            re.search(r"\b" + other + r"\b", summary)
+            for other in opposite_sides.get(side, ())
+        ):
+            return "mismatch"
+
+        return "missing"
+
+    return "preserved"
+
+
+# ============================================================
+# 9. MAIN SUMMARY VERIFICATION
 # ============================================================
 
 def verify_summary(source_note, summary):
     """
     Compare configured source terms against summary terms.
 
-    Returns a DataFrame containing term, category, source status,
-    summary status, verification label, and review priority.
+    Returns a DataFrame containing:
+    - Term
+    - Category
+    - Source Status
+    - Summary Status
+    - Verification
+    - Priority
+
+    The output contains rule-based review flags. It does not
+    establish that a clinical omission or error has occurred.
     """
     columns = [
         "Term",
@@ -781,6 +912,10 @@ def verify_summary(source_note, summary):
 
     rows = []
     seen = set()
+
+    # --------------------------------------------------------
+    # A. Verify configured clinical vocabulary
+    # --------------------------------------------------------
 
     for term, category in _configured_terms():
         if not _term_spans(source_note, term):
@@ -805,13 +940,20 @@ def verify_summary(source_note, summary):
             category,
         )
 
-        # For the general term "pain", the summary must account for
-        # every specific non-negated pain phrase in the source.
+        # The general term "pain" must account for every specific
+        # non-negated pain phrase found in the source.
         if normalize_text(term) == "pain":
-            source_pain = _pain_phrase_mentions(source_note, category)
+            source_pain = _pain_phrase_mentions(
+                source_note,
+                category,
+            )
+
             summary_pain = {
                 phrase
-                for phrase, _ in _pain_phrase_mentions(summary, category)
+                for phrase, _ in _pain_phrase_mentions(
+                    summary,
+                    category,
+                )
             }
 
             if source_pain:
@@ -867,21 +1009,62 @@ def verify_summary(source_note, summary):
             "Priority": _priority(term, category),
         })
 
-    # Additional targeted check for measured clinical findings.
+    # --------------------------------------------------------
+    # B. Verify measured clinical findings
+    # --------------------------------------------------------
+
     for finding in _extract_measured_findings(source_note):
-        preserved = _finding_is_preserved(finding, summary)
+        preserved = _finding_is_preserved(
+            finding,
+            summary,
+        )
 
         rows.append({
             "Term": finding["term"],
             "Category": "Clinical Findings",
             "Source Status": "AFFIRMED_OR_MENTIONED",
             "Summary Status": (
-                "AFFIRMED_OR_MENTIONED" if preserved else "NOT_FOUND"
+                "AFFIRMED_OR_MENTIONED"
+                if preserved
+                else "NOT_FOUND"
             ),
             "Verification": (
                 "TERM FOUND - REVIEW CONTEXT"
                 if preserved
                 else "POSSIBLY MISSING"
+            ),
+            "Priority": "High",
+        })
+
+    # --------------------------------------------------------
+    # C. Verify location-specific tenderness
+    # --------------------------------------------------------
+
+    for finding in _extract_location_specific_tenderness(
+        source_note
+    ):
+        status = _tenderness_location_status(
+            finding,
+            summary,
+        )
+
+        rows.append({
+            "Term": finding["term"],
+            "Category": "Clinical Findings",
+            "Source Status": "AFFIRMED_OR_MENTIONED",
+            "Summary Status": (
+                "AFFIRMED_OR_MENTIONED"
+                if status == "preserved"
+                else "NOT_FOUND"
+            ),
+            "Verification": (
+                "TERM FOUND - REVIEW CONTEXT"
+                if status == "preserved"
+                else (
+                    "CHECK STATUS MISMATCH"
+                    if status == "mismatch"
+                    else "POSSIBLY MISSING"
+                )
             ),
             "Priority": "High",
         })
