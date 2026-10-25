@@ -238,3 +238,13 @@ def test_pain_is_satisfied_by_neck_pain_in_summary():
     summary = "The patient continued to report neck pain."
 
     assert label_for(note, summary, "pain") == "TERM FOUND - REVIEW CONTEXT"
+
+
+def test_abdominal_pain_matches_inside_lower_abdominal_pain():
+    note = "The patient had lower abdominal pain."
+    summary = "The patient had lower abdominal pain."
+
+    assert (
+        label_for(note, summary, "abdominal pain")
+        == "TERM FOUND - REVIEW CONTEXT"
+    )

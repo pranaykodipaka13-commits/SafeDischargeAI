@@ -420,7 +420,10 @@ def _independent_summary_matches(summary, term):
                         or longer_match.end() > match.end()
                     )
                 ):
-                    if normalized_term == "pain":
+                    # Allow a configured specific phrase to satisfy
+                    # its shorter nested phrase in the summary.
+                    # Keep the special handling for standalone "pain".
+                    if normalized_term in {"pain", "abdominal pain"}:
                         continue
 
                     contained_in_longer_phrase = True
