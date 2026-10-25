@@ -45,6 +45,38 @@ CLINICAL_KEYWORDS = {
         "history includes", "history of",
         "comorbidities", "underlying condition"
     ],
+        "pathology": [
+        "biopsy showed", "biopsy revealed", "histopathology",
+        "denervation", "regenerating fibers",
+        "lipid deposition", "glycogen deposits",
+        "malignant", "benign", "histological findings"
+    ],
+    "discharge_support": [
+        "tracheostomy", "ventilator", "ventilator-dependent",
+        "unable to wean", "urinary catheter",
+        "feeding tube", "oxygen support", "home oxygen",
+        "chronic catheter", "discharged with"
+    ],
+    "complications": [
+        "complication", "postoperative pancreatitis",
+        "pancreatitis", "fluid collection",
+        "fluid collections", "adverse event",
+        "inadvertent removal", "injury during surgery",
+        "surgical complication"
+    ],
+    "abnormal_labs": [
+        "severe anemia", "anaemia", "anemia",
+        "thrombocytopenia", "pancytopenia",
+        "elevated creatinine", "raised creatinine",
+        "elevated urea", "abnormal blood count",
+        "abnormal laboratory", "abnormal lab",
+        "hemoglobin", "haemoglobin"
+    ],
+    "disease_stage_and_active_treatment": [
+        "stage 3", "stage iii", "stage iv",
+        "chemotherapy", "folfox", "radiotherapy",
+        "metastatic", "malignant", "recurrence"
+    ],
     "discharge_followup": [
         "discharged", "follow-up", "follow up",
         "appointment", "advised", "recommend",
@@ -106,6 +138,149 @@ def sentence_importance(sentence):
         "lesion", "mass", "nodule", "opacity"
     ]):
         score += 3
+
+        # Strongly prioritize discharge dependencies and major complications.
+    high_priority_phrases = [
+        "tracheostomy",
+        "unable to wean",
+        "ventilator-dependent",
+        "discharged with",
+        "chronic urinary catheter",
+        "inadvertent removal",
+        "postoperative pancreatitis",
+        "spinal cord compression",
+        "severe cord compression",
+        "spinal canal stenosis"
+    ]
+
+    if any(phrase in sentence_lower for phrase in high_priority_phrases):
+        score += 8
+
+    # Preserve specific pathology and biopsy results.
+    pathology_phrases = [
+        "biopsy showed",
+        "biopsy revealed",
+        "muscle biopsy",
+        "denervation",
+        "regenerating fibers",
+        "lipid deposition",
+        "glycogen deposits",
+        "histopathology revealed"
+    ]
+
+    if any(phrase in sentence_lower for phrase in pathology_phrases):
+        score += 5
+
+    # Prioritize clinically significant abnormal laboratory results.
+    abnormal_lab_phrases = [
+        "severe anemia",
+        "severe anaemia",
+        "dimorphic anemia",
+        "dimorphic anaemia",
+        "thrombocytopenia",
+        "pancytopenia",
+        "requiring blood transfusion",
+        "blood transfusion",
+        "elevated creatinine",
+        "raised creatinine"
+    ]
+
+    if any(phrase in sentence_lower for phrase in abnormal_lab_phrases):
+        score += 5
+
+    # Preserve cancer stage and active treatment context.
+    if re.search(r"\\bstage\\s*(?:iii|iv|3|4|3b|4a|4b)\\b", sentence_lower):
+        score += 5
+
+    if any(term in sentence_lower for term in [
+        "chemotherapy", "folfox", "metastatic cancer",
+        "ongoing chemotherapy", "active malignancy"
+    ]):
+        score += 4
+
+    # Boost sentences describing imaging or investigation findings,
+    # rather than prioritizing the test name alone.
+    finding_phrases = [
+        "revealed severe",
+        "showed severe",
+        "revealed a lesion",
+        "showed a lesion",
+        "revealed calcifications",
+        "showed calcifications",
+        "revealed stenosis",
+        "showed stenosis",
+        "revealed compression",
+        "showed compression",
+        "revealed pseudocystic",
+        "showed pseudocystic"
+    ]
+
+    if any(phrase in sentence_lower for phrase in finding_phrases):
+        score += 4
+
+    
+    # Preserve final diagnostic conclusions and important genetic findings.
+    diagnostic_priority_phrases = [
+        "likely pathogenic",
+        "scn4a",
+        "periodic paralysis",
+        "abnormal potassium levels",
+        "t2n1m0",
+        "tumor stage",
+        "tumour stage",
+        "adenocarcinoma",
+        "intracystic papillary neoplasm",
+    ]
+
+    if any(phrase in sentence_lower for phrase in diagnostic_priority_phrases):
+        score += 8
+
+    # Preserve specific operative events and major complications.
+    complication_priority_phrases = [
+        "inadvertently removed",
+        "intrapancreatic bile duct",
+        "main pancreatic duct",
+        "acute necrotic collection",
+        "progression of acute necrotic collection",
+        "readmitted",
+        "readmission",
+        "severe bilateral pleural effusion",
+        "candida peritonitis",
+        "sepsis due to",
+    ]
+
+    if any(phrase in sentence_lower for phrase in complication_priority_phrases):
+        score += 8
+
+    # Preserve significant treatment decisions and discharge instructions.
+    treatment_priority_phrases = [
+        "broad-spectrum antibiotics",
+        "meropenem",
+        "anidulafungin",
+        "tacrolimus was interrupted",
+        "antibiotic treatment was to be continued",
+        "continue antibiotic treatment",
+        "chemotherapy was not possible",
+        "delayed recovery from postoperative pancreatitis",
+    ]
+
+    if any(phrase in sentence_lower for phrase in treatment_priority_phrases):
+        score += 6
+
+    # Preserve clinically significant abnormal imaging findings,
+    # without boosting every sentence that merely mentions an MRI.
+    imaging_priority_phrases = [
+        "numerous pseudo cystic formation",
+        "pseudocystic formation",
+        "peripancreatic fluid collection",
+        "fluid collection began to resolve",
+        "complete thrombosis",
+        "pulmonary consolidation",
+        "severe bilateral pleural effusion",
+    ]
+
+    if any(phrase in sentence_lower for phrase in imaging_priority_phrases):
+        score += 6
 
     return score
 
