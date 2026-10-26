@@ -244,6 +244,15 @@ def find_occurrence_status(text, term, start, category):
 
     before = clause[:relative_start]
 
+    # SAFE_DISCHARGE_LOW_RISK_INFECTION_FIX
+    # A low-risk screening statement does not establish a confirmed infection.
+    if (
+        category == "Diagnoses"
+        and term.lower() == "infection"
+        and re.search(r"\blow\s+risk\s+of\b", before, re.IGNORECASE)
+    ):
+        return "UNCERTAIN"
+
     for pattern in UNCERTAINTY_PATTERNS:
         if re.search(pattern, before, re.IGNORECASE):
             return "UNCERTAIN"
@@ -382,9 +391,17 @@ def _independent_summary_matches(summary, term):
     summary = str(summary)
     normalized_term = normalize_text(term)
 
+    # SAFE_DISCHARGE_PILOT_ALIAS_FIX
     aliases = {
         "anemia": ["anemia", "anaemia"],
         "anaemia": ["anaemia", "anemia"],
+        "cancer": [
+            "cancer", "cancers", "adenocarcinoma",
+            "carcinoma", "malignant neoplasm",
+        ],
+        "infection": [
+            "infection", "infections", "infective endocarditis",
+        ],
     }
 
     variants = aliases.get(normalized_term, [term])
@@ -882,24 +899,116 @@ def _tenderness_location_status(finding, summary):
     return "preserved"
 
 
+
 # ============================================================
 # 9. MAIN SUMMARY VERIFICATION
 # ============================================================
 
+
+def _extract_critical_clinical_details(source_note):
+    """
+    Extract selected clinical details that need explicit preservation.
+
+    This is a limited rule-based detector, not a complete
+    clinical finding or complication extractor.
+    """
+    source_note = str(source_note)
+    details = []
+
+    # 1. Spinal canal stenosis
+    stenosis_pattern = (
+        r"\bspinal\s+canal\s+stenosis\b|"
+        r"\bstenosis\s+of\s+the\s+spinal\s+canal\b"
+    )
+
+    if re.search(stenosis_pattern, source_note, re.IGNORECASE):
+        details.append({
+            "term": "spinal canal stenosis",
+            "summary_pattern": stenosis_pattern,
+        })
+
+    # 2. Measured tracheal lumen
+    airway_pattern = (
+        r"\btracheal\s+lumen\b"
+        r"(?:(?![.!?]).){0,100}?"
+        r"\b(\d+(?:\.\d+)?)\s*-?\s*(mm|cm)\b"
+    )
+
+    airway_match = re.search(
+        airway_pattern,
+        source_note,
+        re.IGNORECASE,
+    )
+
+    if airway_match:
+        value = airway_match.group(1)
+        unit = airway_match.group(2)
+
+        details.append({
+            "term": f"tracheal lumen measurement ({value} {unit})",
+            "summary_pattern": (
+                r"\btracheal\s+lumen\b"
+                r"(?:(?![.!?]).){0,100}?"
+                + rf"\b{re.escape(value)}\s*-?\s*"
+                + rf"{re.escape(unit)}\b"
+            ),
+        })
+
+    # 3. Explicit bile-duct removal or injury
+    # The event verb may appear before or after the duct phrase.
+    bile_duct_patterns = [
+        (
+            r"\b(?:bile|biliary)\s+duct\b"
+            r"(?:(?![.!?]).){0,100}?"
+            r"\b(?:inadvertently\s+|accidentally\s+|"
+            r"unintentionally\s+)?"
+            r"(?:removed|resected|excised|injured|transected)\b"
+        ),
+        (
+            r"\b(?:removed|resected|excised|injured|transected)\b"
+            r"(?:(?![.!?]).){0,100}?"
+            r"\b(?:bile|biliary)\s+duct\b"
+        ),
+    ]
+
+    # A stent "to be removed" is a planned future procedure, not
+    # evidence that the bile duct itself was removed or injured.
+    bile_detection_text = re.sub(
+        r"\bto\s+be\s+removed\b",
+        "",
+        source_note,
+        flags=re.IGNORECASE,
+    )
+
+    if any(
+        re.search(pattern, bile_detection_text, re.IGNORECASE)
+        for pattern in bile_duct_patterns
+    ):
+        details.append({
+            "term": "bile duct removal or injury complication",
+            "summary_pattern": (
+                r"\b(?:bile|biliary)\s+duct\b"
+                r"(?:(?![.!?]).){0,100}?"
+                r"\b(?:inadvertently\s+|accidentally\s+|"
+                r"unintentionally\s+)?"
+                r"(?:removed|resected|excised|injured|transected)\b"
+                r"|"
+                r"\b(?:removed|resected|excised|injured|transected)\b"
+                r"(?:(?![.!?]).){0,100}?"
+                r"\b(?:bile|biliary)\s+duct\b"
+            ),
+        })
+
+    return details
+
+
 def verify_summary(source_note, summary):
     """
-    Compare configured source terms against summary terms.
+    Compare configured source terms and selected clinical details
+    against the generated summary.
 
-    Returns a DataFrame containing:
-    - Term
-    - Category
-    - Source Status
-    - Summary Status
-    - Verification
-    - Priority
-
-    The output contains rule-based review flags. It does not
-    establish that a clinical omission or error has occurred.
+    Returns a DataFrame of rule-based verification flags.
+    Flags indicate possible omissions and require human review.
     """
     columns = [
         "Term",
@@ -1068,6 +1177,34 @@ def verify_summary(source_note, summary):
                     if status == "mismatch"
                     else "POSSIBLY MISSING"
                 )
+            ),
+            "Priority": "High",
+        })
+
+    # --------------------------------------------------------
+    # D. Verify selected critical clinical details
+    # --------------------------------------------------------
+
+    for detail in _extract_critical_clinical_details(source_note):
+        preserved = re.search(
+            detail["summary_pattern"],
+            summary,
+            re.IGNORECASE,
+        ) is not None
+
+        rows.append({
+            "Term": detail["term"],
+            "Category": "Clinical Findings",
+            "Source Status": "AFFIRMED_OR_MENTIONED",
+            "Summary Status": (
+                "AFFIRMED_OR_MENTIONED"
+                if preserved
+                else "NOT_FOUND"
+            ),
+            "Verification": (
+                "TERM FOUND - REVIEW CONTEXT"
+                if preserved
+                else "POSSIBLY MISSING"
             ),
             "Priority": "High",
         })
